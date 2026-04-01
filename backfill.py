@@ -113,7 +113,7 @@ def fetch_creators_without_tiktok_id():
             headers={
                 **supabase_headers(),
                 "Accept": "application/json",
-                "Range": f"{offset}-{offset + 4999}",
+                "Range": f"{offset}-{offset + 999}",
             },
             json={},
             timeout=120,
@@ -123,8 +123,8 @@ def fetch_creators_without_tiktok_id():
             if not rows:
                 break
             outros.extend([row["creator_username"] for row in rows])
-            offset += 5000
-            if len(rows) < 5000:
+            offset += 1000
+            if len(rows) < 1000:
                 break
         else:
             log(f"   ⚠️ RPC falhou (HTTP {r.status_code}): {r.text[:200]}")
