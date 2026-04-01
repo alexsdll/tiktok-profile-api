@@ -117,15 +117,11 @@ def fetch_ativos_2026_without_tiktok_id(excluir: set):
     while True:
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/rpc/get_active_creators_without_tiktok_id",
-            headers={
-                **supabase_headers(),
-                "Accept": "application/json",
-                "Range": f"{offset}-{offset + 999}",
-            },
-            json={},
+            headers={**supabase_headers(), "Accept": "application/json"},
+            json={"p_limit": 1000, "p_offset": offset},
             timeout=120,
         )
-        if r.status_code in (200, 206):
+        if r.status_code == 200:
             rows = r.json()
             if not rows:
                 break
