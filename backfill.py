@@ -1,17 +1,18 @@
 """
-Backfill de tiktok_id e avatar para creators existentes.
+Backfill Coordenador — envia listas pros workers e coleta resultados.
 
 Fluxo:
-  1. Processa ALUNOS (3 etapas: scraping → avatars → banco)
-  2. Processa ATIVOS 2026 (3 etapas: scraping → avatars → banco)
+  1. Busca creators no Supabase
+  2. Divide em chunks (1 por worker)
+  3. Manda cada chunk pro worker via POST /batch
+  4. Workers processam em background (scraping direto no TikTok)
+  5. Coordenador faz polling no /batch/status até todos terminarem
+  6. Coleta resultados via GET /batch/results
+  7. Rounds: falhas do w1 vão pro w2, falhas do w2 pro w3, etc.
+  8. Baixa avatars do CDN e faz upload pro Supabase Storage
+  9. Atualiza banco (tiktok_id, avatar, aliases)
 
-Cada grupo passa pelas 3 etapas completas antes do próximo começar.
-Scraping usa rounds com rotação de workers (igual repo antigo).
-Todos os workers rodam em paralelo dentro de cada round.
-
-Threads por round: [20, 15, 10, 7, 4, 3, 2, 1]
-Delay: 1-2s DEPOIS de cada request.
-Falhas do round N vão pro round N+1 em outro worker.
+Processa ALUNOS primeiro (3 etapas completas), depois ATIVOS 2026.
 
 Variáveis de ambiente (Railway):
   SUPABASE_URL          → URL do projeto Supabase
@@ -24,7 +25,6 @@ Variáveis de ambiente (Railway):
 import requests
 import json
 import time
-import random
 import os
 import sys
 import threading
@@ -45,10 +45,9 @@ WORKERS = [f"https://w{i}.api.mvmcreators.com.br" for i in range(1, WORKER_COUNT
 
 THREADS_PER_ROUND = [20, 15, 10, 7, 4, 3, 2, 1]
 TOTAL_ROUNDS = len(THREADS_PER_ROUND)
-DELAY_MIN = 1.0
-DELAY_MAX = 2.0
 AVATAR_THREADS = 50
 LOG_EVERY = 100
+POLL_INTERVAL = 5  # segundos entre polls de status
 
 
 # ============================================================
@@ -57,6 +56,18 @@ LOG_EVERY = 100
 
 def log(msg: str):
     print(msg, flush=True)
+
+
+def worker_name(idx):
+    return f"w{idx + 1}"
+
+
+def worker_url(idx):
+    return WORKERS[idx]
+
+
+def api_headers():
+    return {"x-api-key": API_KEY}
 
 
 def supabase_headers():
@@ -86,7 +97,6 @@ def save_json(path, data):
 # ============================================================
 
 def fetch_alunos_without_tiktok_id():
-    """Busca alunos (com discord_id) sem tiktok_id."""
     alunos = []
     offset = 0
     while True:
@@ -111,7 +121,6 @@ def fetch_alunos_without_tiktok_id():
 
 
 def fetch_ativos_2026_without_tiktok_id(excluir: set):
-    """Busca creators ativos em 2026 sem tiktok_id, excluindo alunos."""
     outros = []
     offset = 0
     while True:
@@ -139,110 +148,78 @@ def fetch_ativos_2026_without_tiktok_id(excluir: set):
 # SCRAPING POR ROUNDS
 # ============================================================
 
-def scrape_one_attempt(username: str, worker_url: str) -> dict:
-    """Uma tentativa de scraping em um worker específico."""
+def get_worker_for_round(base_idx, round_num):
+    return (base_idx + round_num) % WORKER_COUNT
+
+
+def send_batch_to_worker(w_idx, usernames, num_threads, round_num):
+    """Envia lista de usernames pro worker processar."""
+    wname = worker_name(w_idx)
+    url = worker_url(w_idx)
+
     try:
-        r = requests.get(
-            f"{worker_url}/profile",
-            params={"username": username},
-            headers={"x-api-key": API_KEY},
-            timeout=20,
+        r = requests.post(
+            f"{url}/batch",
+            headers={**api_headers(), "Content-Type": "application/json"},
+            json={"usernames": usernames, "threads": num_threads, "round": round_num},
+            timeout=30,
         )
-
-        # Delay DEPOIS da request (1-2s)
-        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-
         if r.status_code == 200:
-            data = r.json()
-            if "error" not in data:
-                return {
-                    "username": username,
-                    "status": "ok",
-                    "creator_id": data.get("creator_id", ""),
-                    "nome": data.get("nome", ""),
-                    "bio": data.get("bio", ""),
-                    "avatar_url": data.get("avatar_url", ""),
-                    "seguidores": data.get("seguidores", 0),
-                }
-            else:
-                return {"username": username, "status": "not_found"}
-        elif r.status_code == 404:
-            return {"username": username, "status": "not_found"}
+            log(f"   📤 Coordenador enviou {len(usernames):,} contas para {wname}")
+            return True
         else:
-            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-            return {"username": username, "status": f"error_{r.status_code}"}
-    except Exception:
-        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-        return {"username": username, "status": "error_connection"}
+            log(f"   ❌ {wname} rejeitou o batch (HTTP {r.status_code}): {r.text[:100]}")
+            return False
+    except Exception as e:
+        log(f"   ❌ {wname} não respondeu: {e}")
+        return False
 
 
-def process_worker_chunk(round_num, usernames, worker_url, global_results_count):
-    """Processa um chunk de usernames em um worker. Roda em thread separada."""
-    num_threads = THREADS_PER_ROUND[min(round_num, len(THREADS_PER_ROUND) - 1)]
-    total = len(usernames)
+def poll_worker_status(w_idx):
+    """Faz polling no worker até terminar."""
+    wname = worker_name(w_idx)
+    url = worker_url(w_idx)
+    last_processed = 0
 
-    if total == 0:
-        return [], []
-
-    worker_name = worker_url.split("//")[1].split(".")[0]
-    log(f"      📋 {worker_name}: {total:,} usernames | {num_threads} threads")
-
-    results = []
-    failures = []
-    lock = threading.Lock()
-    processed = [0]
-    round_start = datetime.now()
-
-    def on_done(future):
+    while True:
         try:
-            result = future.result()
-        except Exception as e:
-            log(f"      ⚠️ {worker_name} exception: {e}")
-            return
+            r = requests.get(f"{url}/batch/status", headers=api_headers(), timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                status = data["status"]
+                processed = data["processed"]
+                total = data["total"]
+                ok = data["ok"]
+                failed = data["failed"]
 
-        with lock:
-            processed[0] += 1
-            pos = processed[0]
-            status = result["status"]
+                if processed != last_processed and processed % LOG_EVERY < POLL_INTERVAL:
+                    log(f"   ⏳ {wname}: [{processed}/{total}] ✅ {ok} | ❌ {failed}")
+                    last_processed = processed
 
-            if status == "ok":
-                results.append(result)
-                if round_num == 0 and (pos % LOG_EVERY == 0 or pos <= 3):
-                    log(f"      ✅ {worker_name} [{pos}/{total}] @{result['nome']} | {result['seguidores']:,} seg")
-                elif round_num > 0:
-                    log(f"      🎯 {worker_name} [{pos}/{total}] @{result['nome']} (recuperado round {round_num + 1})")
-            elif status == "not_found":
-                pass
-            else:
-                failures.append(result["username"])
+                if status == "done":
+                    log(f"   ✅ {wname} terminou: {ok} OK, {data['not_found']} NF, {failed} falhas")
+                    return True
+        except Exception:
+            pass
 
-            if pos % LOG_EVERY == 0 and pos > 0:
-                elapsed = (datetime.now() - round_start).total_seconds()
-                rate = pos / elapsed if elapsed > 0 else 0
-                eta = (total - pos) / rate / 60 if rate > 0 else 0
-                log(f"      💾 {worker_name} [{pos}/{total}] {pos/total*100:.0f}% — ✅ {len(results)} | ❌ {len(failures)} | ⚡ {rate:.1f}/s | ⏱️ {eta:.0f}min")
-
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = []
-        for username in usernames:
-            future = executor.submit(scrape_one_attempt, username, worker_url)
-            future.add_done_callback(on_done)
-            futures.append(future)
-
-        for future in futures:
-            future.result()
-
-    return results, failures
+        time.sleep(POLL_INTERVAL)
 
 
-def get_worker_for_round(base_worker_idx, round_num):
-    """Qual worker este chunk usa neste round? Rotação circular."""
-    idx = (base_worker_idx + round_num) % WORKER_COUNT
-    return WORKERS[idx]
+def collect_worker_results(w_idx):
+    """Coleta resultados do worker."""
+    url = worker_url(w_idx)
+
+    try:
+        r = requests.get(f"{url}/batch/results", headers=api_headers(), timeout=30)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {"results": [], "failures": [], "ok": 0, "not_found": 0, "failed": 0}
 
 
 def run_scraping(label, creators, results_file, progress_file):
-    """Executa scraping por rounds com todos os workers em paralelo."""
+    """Scraping por rounds com todos os workers em paralelo."""
     progress = load_json(progress_file, {"completed": []})
     completed_set = set(progress.get("completed", []))
     all_results = load_json(results_file, [])
@@ -251,68 +228,91 @@ def run_scraping(label, creators, results_file, progress_file):
 
     log(f"\n{'='*60}")
     log(f"📡 SCRAPING — {label} ({len(creators):,} total, {len(remaining):,} restantes)")
-    log(f"   Threads por round: {THREADS_PER_ROUND}")
-    log(f"   Delay: {DELAY_MIN}-{DELAY_MAX}s após cada request")
-    log(f"   Workers em paralelo: {WORKER_COUNT}")
+    log(f"   🔄 Threads por round: {THREADS_PER_ROUND}")
+    log(f"   📡 {WORKER_COUNT} workers em paralelo")
     log(f"{'='*60}")
 
     if not remaining:
         log(f"   ✨ {label} já completo!")
         return all_results
 
-    # Dividir em chunks (1 por worker)
+    # Dividir em chunks
     chunk_size = len(remaining) // WORKER_COUNT
     chunks = {}
     for c in range(WORKER_COUNT):
-        start_idx = c * chunk_size
-        end_idx = len(remaining) if c == WORKER_COUNT - 1 else (c + 1) * chunk_size
-        chunks[c] = remaining[start_idx:end_idx]
+        start = c * chunk_size
+        end = len(remaining) if c == WORKER_COUNT - 1 else (c + 1) * chunk_size
+        chunks[c] = remaining[start:end]
 
-    # Rounds
     for round_num in range(TOTAL_ROUNDS):
         num_threads = THREADS_PER_ROUND[min(round_num, len(THREADS_PER_ROUND) - 1)]
-
         total_remaining = sum(len(chunks[c]) for c in range(WORKER_COUNT))
+
         if total_remaining == 0:
             log(f"\n   ✨ Todas as contas processadas!")
             break
 
         log(f"\n   🔁 ROUND {round_num + 1}/{TOTAL_ROUNDS} — {num_threads} threads/worker — {total_remaining:,} restantes")
 
-        # Rodar TODOS os workers em paralelo
+        # 1. Enviar batches para todos os workers
+        log(f"\n   📤 Coordenador distribuindo contas para os workers...")
+        active_workers = []
+        for base_idx in range(WORKER_COUNT):
+            chunk = chunks[base_idx]
+            if not chunk:
+                continue
+            w_idx = get_worker_for_round(base_idx, round_num)
+            success = send_batch_to_worker(w_idx, chunk, num_threads, round_num)
+            if success:
+                active_workers.append((base_idx, w_idx))
+
+        if not active_workers:
+            log(f"   ❌ Nenhum worker aceitou o batch!")
+            break
+
+        # 2. Esperar todos os workers terminarem (polling em paralelo)
+        log(f"\n   ⏳ Coordenador aguardando {len(active_workers)} workers terminarem...")
+
+        with ThreadPoolExecutor(max_workers=WORKER_COUNT) as executor:
+            poll_futures = {executor.submit(poll_worker_status, w_idx): (base_idx, w_idx)
+                           for base_idx, w_idx in active_workers}
+            for future in as_completed(poll_futures):
+                future.result()
+
+        # 3. Coletar resultados de todos os workers
+        log(f"\n   📥 Coordenador coletando resultados...")
         round_results = []
         new_chunks = {}
-        worker_threads = []
 
-        def worker_task(worker_idx):
-            chunk = chunks[worker_idx]
-            if not chunk:
-                return worker_idx, [], []
-            worker_url = get_worker_for_round(worker_idx, round_num)
-            results, failures = process_worker_chunk(round_num, chunk, worker_url, len(all_results))
-            return worker_idx, results, failures
+        for base_idx, w_idx in active_workers:
+            wname = worker_name(w_idx)
+            data = collect_worker_results(w_idx)
+            results = data.get("results", [])
+            failures = data.get("failures", [])
 
-        with ThreadPoolExecutor(max_workers=WORKER_COUNT) as worker_executor:
-            futures = {worker_executor.submit(worker_task, idx): idx for idx in range(WORKER_COUNT)}
+            log(f"   📥 {wname} entregou {len(results):,} perfis e {len(failures):,} falhas")
 
-            for future in as_completed(futures):
-                worker_idx, results, failures = future.result()
-                round_results.extend(results)
-                new_chunks[worker_idx] = failures
+            round_results.extend(results)
+            new_chunks[base_idx] = failures
+
+        # Preencher chunks vazios
+        for base_idx in range(WORKER_COUNT):
+            if base_idx not in new_chunks:
+                new_chunks[base_idx] = []
 
         # Acumular resultados
         for r in round_results:
             all_results.append(r)
             completed_set.add(r["username"])
 
-        # Rotacionar chunks: cada worker pega as falhas do anterior
-        rotated_chunks = {}
-        for worker_idx in range(WORKER_COUNT):
-            prev_idx = (worker_idx - 1) % WORKER_COUNT
-            rotated_chunks[worker_idx] = new_chunks.get(prev_idx, [])
-        chunks = rotated_chunks
+        # Rotacionar chunks: cada slot pega as falhas do anterior
+        rotated = {}
+        for idx in range(WORKER_COUNT):
+            prev = (idx - 1) % WORKER_COUNT
+            rotated[idx] = new_chunks.get(prev, [])
+        chunks = rotated
 
-        # Salvar checkpoint
+        # Checkpoint
         save_json(results_file, all_results)
         save_json(progress_file, {"completed": list(completed_set)})
 
@@ -336,7 +336,6 @@ def run_scraping(label, creators, results_file, progress_file):
 # ============================================================
 
 def upload_avatar(item: dict) -> dict:
-    """Baixa avatar do CDN do TikTok e faz upload pro Supabase Storage."""
     username = item["username"]
     avatar_url = item.get("avatar_url", "")
 
@@ -373,7 +372,6 @@ def upload_avatar(item: dict) -> dict:
 
 
 def run_avatars(label, results):
-    """Baixa avatars do CDN e faz upload pro Supabase Storage."""
     with_avatar = [r for r in results if r.get("status") == "ok" and r.get("avatar_url")]
 
     log(f"\n{'='*60}")
@@ -415,16 +413,15 @@ def run_avatars(label, results):
             except Exception as e:
                 log(f"   ⚠️ Exception: {e}")
 
-    log(f"   ✅ Avatars {label} completo: {stats['ok']:,} salvos")
+    log(f"   ✅ Avatars {label}: {stats['ok']:,} salvos")
     return avatar_map
 
 
 # ============================================================
-# ATUALIZAR BANCO
+# BANCO
 # ============================================================
 
 def run_banco(label, results, avatar_map):
-    """Atualiza creators no banco + registra aliases."""
     ok_results = [r for r in results if r.get("status") == "ok" and r.get("creator_id")]
 
     log(f"\n{'='*60}")
@@ -483,18 +480,17 @@ def run_banco(label, results, avatar_map):
             eta_min = (total - i) / rate / 60 if rate > 0 else 0
 
             log(f"   🗄️ [{i:,}/{total:,}] {i/total*100:.1f}%")
-            log(f"      ✅ Atualizados: {stats['updated']:,} | ❌ Falha: {stats['failed']:,}")
+            log(f"      ✅ {stats['updated']:,} atualizados | ❌ {stats['failed']:,} falhas")
             log(f"      ⚡ {rate:.1f}/s | ⏱️ ETA {eta_min:.0f}min\n")
 
-    log(f"   ✅ Banco {label} completo: {stats['updated']:,} atualizados")
+    log(f"   ✅ Banco {label}: {stats['updated']:,} atualizados")
 
 
 # ============================================================
-# PROCESSAR UM GRUPO (3 etapas completas)
+# PROCESSAR GRUPO (3 etapas)
 # ============================================================
 
 def process_group(label, creators, file_prefix):
-    """Processa um grupo completo: scraping → avatars → banco."""
     results_file = os.path.join(DATA_DIR, f"{file_prefix}_results.json")
     progress_file = os.path.join(DATA_DIR, f"{file_prefix}_progress.json")
 
@@ -504,27 +500,17 @@ def process_group(label, creators, file_prefix):
 
     start_time = datetime.now()
 
-    # Etapa 1 — Scraping
     results = run_scraping(label, creators, results_file, progress_file)
-
-    # Etapa 2 — Avatars
     avatar_map = run_avatars(label, results)
-
-    # Salvar avatar_map
     save_json(os.path.join(DATA_DIR, f"{file_prefix}_avatars.json"), avatar_map)
-
-    # Etapa 3 — Banco
     run_banco(label, results, avatar_map)
 
-    # Resumo do grupo
     duration = datetime.now() - start_time
     mins = int(duration.total_seconds() // 60)
     ok_count = sum(1 for r in results if r.get("status") == "ok")
-    nf_count = sum(1 for r in results if r.get("status") == "not_found")
 
     log(f"\n{'='*60}")
-    log(f"✅ {label} COMPLETO — {mins}min")
-    log(f"   ✅ OK: {ok_count:,} | 👻 NF: {nf_count:,} | 📸 Avatars: {len(avatar_map):,}")
+    log(f"✅ {label} COMPLETO — {mins}min | ✅ {ok_count:,} OK | 📸 {len(avatar_map):,} avatars")
     log(f"{'='*60}\n")
 
     return results, avatar_map
@@ -541,8 +527,8 @@ def main():
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    log(f"🚀 Backfill — rounds + checkpoint")
-    log(f"   📡 {WORKER_COUNT} workers (em paralelo)")
+    log(f"🎯 Coordenador de Backfill")
+    log(f"   📡 {WORKER_COUNT} workers")
     log(f"   🔄 Threads por round: {THREADS_PER_ROUND}")
     log(f"   📸 {AVATAR_THREADS} threads pra avatars")
     log(f"   💾 Checkpoint: {DATA_DIR}")
@@ -568,32 +554,27 @@ def main():
 
     global_start = datetime.now()
 
-    # ========================================
-    # GRUPO 1: ALUNOS (3 etapas completas)
-    # ========================================
+    # GRUPO 1: ALUNOS
     log("🔍 Buscando alunos sem tiktok_id...")
     alunos = fetch_alunos_without_tiktok_id()
-    log(f"   🎓 Alunos sem tiktok_id: {len(alunos):,}")
+    log(f"   🎓 Alunos: {len(alunos):,}")
 
     if alunos:
-        alunos_results, alunos_avatars = process_group("🎓 Alunos", alunos, "alunos")
+        process_group("🎓 Alunos", alunos, "alunos")
     else:
         log("   ✨ Todos os alunos já têm tiktok_id!")
 
-    # ========================================
-    # GRUPO 2: ATIVOS 2026 (3 etapas completas)
-    # ========================================
-    log("\n🔍 Buscando creators ativos 2026 sem tiktok_id...")
+    # GRUPO 2: ATIVOS 2026
+    log("\n🔍 Buscando creators ativos 2026...")
     alunos_set = set(alunos) if alunos else set()
     ativos = fetch_ativos_2026_without_tiktok_id(alunos_set)
-    log(f"   👤 Ativos 2026 sem tiktok_id: {len(ativos):,}")
+    log(f"   👤 Ativos 2026: {len(ativos):,}")
 
     if ativos:
-        ativos_results, ativos_avatars = process_group("👤 Ativos 2026", ativos, "ativos")
+        process_group("👤 Ativos 2026", ativos, "ativos")
     else:
         log("   ✨ Todos os ativos já têm tiktok_id!")
 
-    # Relatório final
     duration = datetime.now() - global_start
     hours = int(duration.total_seconds() // 3600)
     mins = int((duration.total_seconds() % 3600) // 60)
@@ -601,7 +582,6 @@ def main():
     log(f"\n{'='*60}")
     log(f"🏁 BACKFILL COMPLETO — {hours}h {mins}min")
     log(f"{'='*60}")
-    log(f"🏁 Finalizado!")
 
 
 if __name__ == "__main__":
