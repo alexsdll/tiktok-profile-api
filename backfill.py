@@ -218,17 +218,23 @@ def collect_worker_results(w_idx):
     return {"results": [], "failures": [], "ok": 0, "not_found": 0, "failed": 0}
 
 
-def run_scraping(label, creators, results_file, progress_file):
+def run_scraping(label, creators, results_file, progress_file, max_rounds=None):
     """Scraping por rounds com todos os workers em paralelo."""
+    if max_rounds is None:
+        max_rounds = TOTAL_ROUNDS
+
     progress = load_json(progress_file, {"completed": []})
     completed_set = set(progress.get("completed", []))
     all_results = load_json(results_file, [])
 
+    already_done = len(completed_set)
     remaining = [c for c in creators if c not in completed_set]
 
     log(f"\n{'='*60}")
-    log(f"📡 SCRAPING — {label} ({len(creators):,} total, {len(remaining):,} restantes)")
-    log(f"   🔄 Threads por round: {THREADS_PER_ROUND}")
+    log(f"📡 SCRAPING — {label} ({len(creators):,} total)")
+    log(f"   ✅ Já processados: {already_done:,}")
+    log(f"   📋 Restantes: {len(remaining):,}")
+    log(f"   🔄 Rounds: {max_rounds} | Threads: {THREADS_PER_ROUND[:max_rounds]}")
     log(f"   📡 {WORKER_COUNT} workers em paralelo")
     log(f"{'='*60}")
 
@@ -244,7 +250,7 @@ def run_scraping(label, creators, results_file, progress_file):
         end = len(remaining) if c == WORKER_COUNT - 1 else (c + 1) * chunk_size
         chunks[c] = remaining[start:end]
 
-    for round_num in range(TOTAL_ROUNDS):
+    for round_num in range(max_rounds):
         num_threads = THREADS_PER_ROUND[min(round_num, len(THREADS_PER_ROUND) - 1)]
         total_remaining = sum(len(chunks[c]) for c in range(WORKER_COUNT))
 
@@ -252,7 +258,7 @@ def run_scraping(label, creators, results_file, progress_file):
             log(f"\n   ✨ Todas as contas processadas!")
             break
 
-        log(f"\n   🔁 ROUND {round_num + 1}/{TOTAL_ROUNDS} — {num_threads} threads/worker — {total_remaining:,} restantes")
+        log(f"\n   🔁 ROUND {round_num + 1}/{max_rounds} — {num_threads} threads/worker — {total_remaining:,} restantes")
 
         # 1. Enviar batches para todos os workers
         log(f"\n   📤 Coordenador distribuindo contas para os workers...")
@@ -490,7 +496,7 @@ def run_banco(label, results, avatar_map):
 # PROCESSAR GRUPO (3 etapas)
 # ============================================================
 
-def process_group(label, creators, file_prefix):
+def process_group(label, creators, file_prefix, max_rounds=None):
     results_file = os.path.join(DATA_DIR, f"{file_prefix}_results.json")
     progress_file = os.path.join(DATA_DIR, f"{file_prefix}_progress.json")
 
@@ -500,7 +506,7 @@ def process_group(label, creators, file_prefix):
 
     start_time = datetime.now()
 
-    results = run_scraping(label, creators, results_file, progress_file)
+    results = run_scraping(label, creators, results_file, progress_file, max_rounds=max_rounds)
     avatar_map = run_avatars(label, results)
     save_json(os.path.join(DATA_DIR, f"{file_prefix}_avatars.json"), avatar_map)
     run_banco(label, results, avatar_map)
@@ -560,7 +566,7 @@ def main():
     log(f"   🎓 Alunos: {len(alunos):,}")
 
     if alunos:
-        process_group("🎓 Alunos", alunos, "alunos")
+        process_group("🎓 Alunos", alunos, "alunos", max_rounds=1)
     else:
         log("   ✨ Todos os alunos já têm tiktok_id!")
 
@@ -571,7 +577,7 @@ def main():
     log(f"   👤 Ativos 2026: {len(ativos):,}")
 
     if ativos:
-        process_group("👤 Ativos 2026", ativos, "ativos")
+        process_group("👤 Ativos 2026", ativos, "ativos", max_rounds=3)
     else:
         log("   ✨ Todos os ativos já têm tiktok_id!")
 
