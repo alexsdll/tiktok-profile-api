@@ -2,6 +2,10 @@
 Backfill de tiktok_id e avatar para creators existentes.
 Roda uma vez, preenche todos os creators sem tiktok_id.
 
+Prioridade: alunos primeiro, depois creators ativos em 2026.
+Failover: cada creator tenta w1, se falha tenta w2, w3... até w10.
+Threads: 20 por worker = 200 simultâneas.
+
 Variáveis de ambiente (Railway):
   SUPABASE_URL          → URL do projeto Supabase
   SUPABASE_SERVICE_KEY  → Service role key
@@ -10,7 +14,6 @@ Variáveis de ambiente (Railway):
 """
 
 import requests
-import json
 import time
 import os
 import sys
@@ -29,9 +32,9 @@ WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "10"))
 
 WORKERS = [f"https://w{i}.api.mvmcreators.com.br" for i in range(1, WORKER_COUNT + 1)]
 
-BATCH_SIZE = 500        # Quantos creators buscar do Supabase por vez
-SAVE_EVERY = 50         # Log de progresso a cada N creators
-CONCURRENT_PER_WORKER = 3  # Requests simultâneas por worker (total = 30)
+THREADS_PER_WORKER = 20
+SAVE_EVERY = 100
+
 
 # ============================================================
 # HELPERS
@@ -56,10 +59,10 @@ def supabase_headers():
 # ============================================================
 
 def fetch_creators_without_tiktok_id():
-    """Busca todos os creators sem tiktok_id que foram ativos em 2026."""
+    """Busca todos os creators sem tiktok_id: alunos primeiro, depois ativos 2026."""
     log("Buscando creators sem tiktok_id...")
 
-    # Primeiro: alunos (prioridade)
+    # 1. Alunos (prioridade)
     alunos = []
     offset = 0
     while True:
@@ -83,49 +86,34 @@ def fetch_creators_without_tiktok_id():
 
     log(f"  Alunos sem tiktok_id: {len(alunos):,}")
 
-    # Segundo: creators ativos em 2026 que não são alunos
-    # Usa RPC ou query direta em creator_brand_day
-    ativos = []
-    r = requests.post(
-        f"{SUPABASE_URL}/rest/v1/rpc/get_creators_without_tiktok_id",
-        headers={**supabase_headers(), "Accept": "application/json"},
-        json={},
-        timeout=60,
-    )
+    # 2. Outros creators sem tiktok_id
+    outros = []
+    offset = 0
+    while True:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/creators",
+            headers={**supabase_headers(), "Accept": "application/json", "Accept-Profile": "public"},
+            params={
+                "select": '"Creator username"',
+                "tiktok_id": "is.null",
+                "discord_id": "is.null",
+                "limit": 1000,
+                "offset": offset,
+            },
+            timeout=30,
+        )
+        rows = r.json()
+        if not rows:
+            break
+        outros.extend([row["Creator username"] for row in rows])
+        offset += 1000
 
-    if r.status_code == 200:
-        ativos = [row["creator_username"] for row in r.json()]
-    else:
-        log(f"  ⚠️ RPC não encontrada (HTTP {r.status_code}), buscando manualmente...")
-        # Fallback: buscar direto da tabela creators
-        offset = 0
-        while True:
-            r = requests.get(
-                f"{SUPABASE_URL}/rest/v1/creators",
-                headers={**supabase_headers(), "Accept": "application/json", "Accept-Profile": "public"},
-                params={
-                    "select": '"Creator username"',
-                    "tiktok_id": "is.null",
-                    "discord_id": "is.null",
-                    "limit": 1000,
-                    "offset": offset,
-                },
-                timeout=30,
-            )
-            rows = r.json()
-            if not rows:
-                break
-            ativos.extend([row["Creator username"] for row in rows])
-            offset += 1000
+    log(f"  Outros creators sem tiktok_id: {len(outros):,}")
 
-    log(f"  Outros creators sem tiktok_id: {len(ativos):,}")
-
-    # Alunos primeiro, depois o resto
-    all_creators = alunos + ativos
-    # Deduplicar mantendo ordem
+    # Alunos primeiro, depois o resto (deduplicar)
     seen = set()
     unique = []
-    for c in all_creators:
+    for c in alunos + outros:
         if c not in seen:
             seen.add(c)
             unique.append(c)
@@ -135,27 +123,37 @@ def fetch_creators_without_tiktok_id():
 
 
 # ============================================================
+# WORKER ASSIGNMENT
+# ============================================================
+
+# Cada creator recebe um worker inicial via round-robin.
+# Se falhar, tenta o próximo worker (w1→w2→w3→...→w10→w1).
+assign_lock = threading.Lock()
+assign_counter = [0]
+
+
+def get_initial_worker_index():
+    """Retorna o índice do worker inicial para este creator (round-robin)."""
+    with assign_lock:
+        idx = assign_counter[0] % WORKER_COUNT
+        assign_counter[0] += 1
+        return idx
+
+
+# ============================================================
 # SCRAPE + UPLOAD AVATAR
 # ============================================================
 
-worker_index = [0]
-worker_lock = threading.Lock()
-
-
-def get_next_worker():
-    """Round-robin entre workers."""
-    with worker_lock:
-        idx = worker_index[0] % len(WORKERS)
-        worker_index[0] += 1
-        return WORKERS[idx]
-
-
 def scrape_and_save(username: str) -> dict:
-    """Faz scraping de um creator, baixa avatar e salva no Supabase."""
-    # 1. Scraping com failover
+    """Faz scraping de um creator com failover rotacional entre workers."""
+    start_idx = get_initial_worker_index()
+
+    # Tentar todos os workers em rotação: w_start → w_start+1 → ... → w_start-1
     profile = None
-    for attempt in range(len(WORKERS)):
-        worker_url = get_next_worker()
+    for attempt in range(WORKER_COUNT):
+        worker_idx = (start_idx + attempt) % WORKER_COUNT
+        worker_url = WORKERS[worker_idx]
+
         try:
             r = requests.get(
                 f"{worker_url}/profile",
@@ -180,7 +178,7 @@ def scrape_and_save(username: str) -> dict:
     if not tiktok_id:
         return {"username": username, "status": "no_creator_id"}
 
-    # 2. Download e upload do avatar
+    # Download e upload do avatar
     avatar_url = profile.get("avatar_url", "")
     final_avatar_url = None
 
@@ -206,9 +204,9 @@ def scrape_and_save(username: str) -> dict:
                 if upload_r.status_code in (200, 201):
                     final_avatar_url = f"{SUPABASE_URL}/storage/v1/object/public/creator-avatars/{storage_path}"
         except Exception:
-            pass  # Avatar falhou, segue sem
+            pass
 
-    # 3. Update no banco: creators
+    # Update no banco: creators
     update_data = {"tiktok_id": tiktok_id}
     if profile.get("nome"):
         update_data["creator_name"] = profile["nome"]
@@ -225,7 +223,7 @@ def scrape_and_save(username: str) -> dict:
         timeout=15,
     )
 
-    # 4. Registrar alias
+    # Registrar alias
     requests.post(
         f"{SUPABASE_URL}/rest/v1/creator_aliases",
         headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
@@ -253,11 +251,14 @@ def scrape_and_save(username: str) -> dict:
 
 def main():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not API_KEY:
-        log("❌ Variáveis SUPABASE_URL, SUPABASE_SERVICE_KEY e API_KEY são obrigatórias!")
+        log("Variaveis SUPABASE_URL, SUPABASE_SERVICE_KEY e API_KEY sao obrigatorias!")
         sys.exit(1)
 
-    log(f"🚀 Backfill — {WORKER_COUNT} workers, {CONCURRENT_PER_WORKER * WORKER_COUNT} threads")
-    log(f"📡 Workers: w1-w{WORKER_COUNT}.api.mvmcreators.com.br")
+    max_threads = THREADS_PER_WORKER * WORKER_COUNT
+
+    log(f"Backfill -- {WORKER_COUNT} workers, {THREADS_PER_WORKER} threads/worker, {max_threads} total")
+    log(f"Workers: w1-w{WORKER_COUNT}.api.mvmcreators.com.br")
+    log(f"Failover: cada creator tenta todos os {WORKER_COUNT} workers em rotacao")
 
     # Verificar workers
     online = 0
@@ -266,12 +267,14 @@ def main():
             r = requests.get(f"{w}/health", timeout=5)
             if r.status_code == 200:
                 online += 1
+            else:
+                log(f"  {w} -> HTTP {r.status_code}")
         except Exception:
-            log(f"  ⚠️ {w} offline!")
+            log(f"  {w} offline!")
     log(f"  Workers online: {online}/{WORKER_COUNT}")
 
     if online == 0:
-        log("❌ Nenhum worker online!")
+        log("Nenhum worker online!")
         sys.exit(1)
 
     # Buscar creators
@@ -279,7 +282,7 @@ def main():
     total = len(creators)
 
     if total == 0:
-        log("✅ Todos os creators já têm tiktok_id!")
+        log("Todos os creators ja tem tiktok_id!")
         return
 
     # Stats
@@ -287,10 +290,8 @@ def main():
     stats_lock = threading.Lock()
     start_time = datetime.now()
 
-    max_threads = CONCURRENT_PER_WORKER * WORKER_COUNT
-
     log(f"\n{'='*60}")
-    log(f"🔄 Processando {total:,} creators com {max_threads} threads")
+    log(f"Processando {total:,} creators com {max_threads} threads")
     log(f"{'='*60}\n")
 
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
@@ -314,12 +315,12 @@ def main():
                         eta_min = (total - i) / rate / 60 if rate > 0 else 0
                         log(
                             f"  [{i:,}/{total:,}] {i/total*100:.1f}% | "
-                            f"✅ {stats['ok']:,} | 👻 {stats['not_found']:,} | "
-                            f"❌ {stats['scrape_failed']:,} | 📸 {stats['avatar_ok']:,} avatars | "
-                            f"⚡ {rate:.1f}/s | ETA {eta_min:.0f}min"
+                            f"OK {stats['ok']:,} | NF {stats['not_found']:,} | "
+                            f"FAIL {stats['scrape_failed']:,} | AVT {stats['avatar_ok']:,} | "
+                            f"{rate:.1f}/s | ETA {eta_min:.0f}min"
                         )
             except Exception as e:
-                log(f"  ⚠️ Exception: {e}")
+                log(f"  Exception: {e}")
 
     # Relatório final
     duration = datetime.now() - start_time
@@ -327,15 +328,15 @@ def main():
     mins = int((duration.total_seconds() % 3600) // 60)
 
     log(f"\n{'='*60}")
-    log(f"📊 BACKFILL COMPLETO — {hours}h {mins}min")
+    log(f"BACKFILL COMPLETO -- {hours}h {mins}min")
     log(f"{'='*60}")
     log(f"  Total processados: {total:,}")
-    log(f"  ✅ Sucesso:        {stats['ok']:,}")
-    log(f"  👻 Não encontrado: {stats['not_found']:,}")
-    log(f"  ❌ Falha scraping: {stats['scrape_failed']:,}")
-    log(f"  🆔 Sem creator_id: {stats['no_creator_id']:,}")
-    log(f"  📸 Avatars salvos: {stats['avatar_ok']:,}")
-    log(f"\n🏁 Backfill finalizado!")
+    log(f"  OK:              {stats['ok']:,}")
+    log(f"  Nao encontrado:  {stats['not_found']:,}")
+    log(f"  Falha scraping:  {stats['scrape_failed']:,}")
+    log(f"  Sem creator_id:  {stats['no_creator_id']:,}")
+    log(f"  Avatars salvos:  {stats['avatar_ok']:,}")
+    log(f"\nBackfill finalizado!")
 
 
 if __name__ == "__main__":
