@@ -106,16 +106,29 @@ def fetch_creators_without_tiktok_id():
 
     # Ativos em 2026 (vendeu, postou vídeo ou fez live) que não são alunos
     outros = []
-    r = requests.post(
-        f"{SUPABASE_URL}/rest/v1/rpc/get_active_creators_without_tiktok_id",
-        headers={**supabase_headers(), "Accept": "application/json"},
-        json={},
-        timeout=120,
-    )
-    if r.status_code == 200:
-        outros = [row["creator_username"] for row in r.json()]
-    else:
-        log(f"   ⚠️ RPC falhou (HTTP {r.status_code}): {r.text[:200]}")
+    offset = 0
+    while True:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/get_active_creators_without_tiktok_id",
+            headers={
+                **supabase_headers(),
+                "Accept": "application/json",
+                "Range": f"{offset}-{offset + 4999}",
+            },
+            json={},
+            timeout=120,
+        )
+        if r.status_code in (200, 206):
+            rows = r.json()
+            if not rows:
+                break
+            outros.extend([row["creator_username"] for row in rows])
+            offset += 5000
+            if len(rows) < 5000:
+                break
+        else:
+            log(f"   ⚠️ RPC falhou (HTTP {r.status_code}): {r.text[:200]}")
+            break
 
     log(f"   👤 Ativos 2026 sem tiktok_id: {len(outros):,}")
 
