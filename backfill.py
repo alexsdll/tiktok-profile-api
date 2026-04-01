@@ -78,9 +78,8 @@ def save_json(path, data):
 # FETCH CREATORS SEM TIKTOK_ID
 # ============================================================
 
-def fetch_creators_without_tiktok_id():
-    log("🔍 Buscando creators sem tiktok_id...")
-
+def fetch_alunos_without_tiktok_id():
+    """Busca alunos (com discord_id) sem tiktok_id."""
     alunos = []
     offset = 0
     while True:
@@ -101,10 +100,11 @@ def fetch_creators_without_tiktok_id():
             break
         alunos.extend([row["Creator username"] for row in rows])
         offset += 1000
+    return alunos
 
-    log(f"   🎓 Alunos sem tiktok_id: {len(alunos):,}")
 
-    # Ativos em 2026 (vendeu, postou vídeo ou fez live) que não são alunos
+def fetch_ativos_2026_without_tiktok_id(excluir: set):
+    """Busca creators ativos em 2026 (GMV>0, vídeos>0 ou lives>0) sem tiktok_id, excluindo alunos."""
     outros = []
     offset = 0
     while True:
@@ -122,25 +122,14 @@ def fetch_creators_without_tiktok_id():
             rows = r.json()
             if not rows:
                 break
-            outros.extend([row["creator_username"] for row in rows])
+            outros.extend([row["creator_username"] for row in rows if row["creator_username"] not in excluir])
             offset += 1000
             if len(rows) < 1000:
                 break
         else:
             log(f"   ⚠️ RPC falhou (HTTP {r.status_code}): {r.text[:200]}")
             break
-
-    log(f"   👤 Ativos 2026 sem tiktok_id: {len(outros):,}")
-
-    seen = set()
-    unique = []
-    for c in alunos + outros:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-
-    log(f"   📋 Total a processar: {len(unique):,}")
-    return unique
+    return outros
 
 
 # ============================================================
@@ -200,33 +189,23 @@ def scrape_one(username: str) -> dict:
     return {"username": username, "status": "scrape_failed"}
 
 
-def etapa1_scraping(creators: list):
-    """Etapa 1: scraping de todos os creators. Salva resultados incrementalmente."""
-    log(f"\n{'='*60}")
-    log(f"📡 ETAPA 1 — SCRAPING ({len(creators):,} creators)")
-    log(f"   {WORKER_COUNT} workers × {THREADS_PER_WORKER} threads = {THREADS_PER_WORKER * WORKER_COUNT} simultâneas")
-    log(f"   Delay: {DELAY_BETWEEN_REQUESTS}s entre requests")
-    log(f"{'='*60}\n")
-
-    # Carregar progresso anterior (se existir)
-    progress = load_json(PROGRESS_FILE, {"completed": []})
-    completed_set = set(progress.get("completed", []))
-    results = load_json(RESULTS_FILE, [])
-
+def scrape_batch(label: str, creators: list, results: list, completed_set: set):
+    """Processa um bloco de creators. Retorna results e completed_set atualizados."""
     remaining = [c for c in creators if c not in completed_set]
-    log(f"   ✅ Já processados: {len(completed_set):,}")
+
+    log(f"\n   🏷️ {label}")
+    log(f"   ✅ Já processados: {len(creators) - len(remaining):,}")
     log(f"   📋 Restantes: {len(remaining):,}\n")
 
     if not remaining:
-        log("   ✨ Etapa 1 já completa!")
-        return results
+        log(f"   ✨ {label} já completo!")
+        return results, completed_set
 
     stats = {"ok": 0, "retry_ok": 0, "not_found": 0, "scrape_failed": 0}
     stats_lock = threading.Lock()
     results_lock = threading.Lock()
     start_time = datetime.now()
     total = len(remaining)
-
     max_threads = THREADS_PER_WORKER * WORKER_COUNT
 
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
@@ -246,7 +225,6 @@ def etapa1_scraping(creators: list):
                     results.append(result)
                     completed_set.add(username)
 
-                    # Salvar incrementalmente a cada LOG_EVERY
                     if i % LOG_EVERY == 0 or i == total:
                         save_json(RESULTS_FILE, results)
                         save_json(PROGRESS_FILE, {"completed": list(completed_set)})
@@ -257,7 +235,7 @@ def etapa1_scraping(creators: list):
                         total_ok = stats["ok"] + stats["retry_ok"]
                         total_err = stats["not_found"] + stats["scrape_failed"]
 
-                        log(f"📊 [{i:,}/{total:,}] {i/total*100:.1f}%")
+                        log(f"📊 [{i:,}/{total:,}] {i/total*100:.1f}% — {label}")
                         log(f"   ✅ OK: {stats['ok']:,}")
                         log(f"   🔄 Retry OK: {stats['retry_ok']:,}")
                         log(f"   ❌ Erros: {total_err:,} (👻 {stats['not_found']:,} NF | 💀 {stats['scrape_failed']:,} fail)")
@@ -266,12 +244,38 @@ def etapa1_scraping(creators: list):
             except Exception as e:
                 log(f"   ⚠️ Exception: {e}")
 
-    # Salvar final
     save_json(RESULTS_FILE, results)
     save_json(PROGRESS_FILE, {"completed": list(completed_set)})
 
     total_ok = stats["ok"] + stats["retry_ok"]
-    log(f"   ✅ Etapa 1 completa: {total_ok:,} perfis obtidos")
+    log(f"   ✅ {label} completo: {total_ok:,} perfis obtidos")
+    return results, completed_set
+
+
+def etapa1_scraping(alunos: list, ativos: list):
+    """Etapa 1: scraping em dois blocos — alunos primeiro, depois ativos 2026."""
+    total_geral = len(alunos) + len(ativos)
+
+    log(f"\n{'='*60}")
+    log(f"📡 ETAPA 1 — SCRAPING ({total_geral:,} creators)")
+    log(f"   {WORKER_COUNT} workers × {THREADS_PER_WORKER} threads = {THREADS_PER_WORKER * WORKER_COUNT} simultâneas")
+    log(f"   Delay: {DELAY_BETWEEN_REQUESTS}s entre requests")
+    log(f"   Ordem: 🎓 Alunos ({len(alunos):,}) → 👤 Ativos 2026 ({len(ativos):,})")
+    log(f"{'='*60}")
+
+    # Carregar progresso anterior
+    progress = load_json(PROGRESS_FILE, {"completed": []})
+    completed_set = set(progress.get("completed", []))
+    results = load_json(RESULTS_FILE, [])
+
+    # Bloco 1: Alunos
+    results, completed_set = scrape_batch("🎓 Alunos", alunos, results, completed_set)
+
+    # Bloco 2: Ativos 2026
+    results, completed_set = scrape_batch("👤 Ativos 2026", ativos, results, completed_set)
+
+    total_ok = sum(1 for r in results if r.get("status") in ("ok", "retry_ok"))
+    log(f"\n   ✅ Etapa 1 completa: {total_ok:,} perfis obtidos no total")
     return results
 
 
@@ -477,15 +481,23 @@ def main():
         sys.exit(1)
 
     # Buscar creators
-    creators = fetch_creators_without_tiktok_id()
-    if not creators:
+    log("🔍 Buscando creators sem tiktok_id...")
+    alunos = fetch_alunos_without_tiktok_id()
+    log(f"   🎓 Alunos sem tiktok_id: {len(alunos):,}")
+
+    alunos_set = set(alunos)
+    ativos = fetch_ativos_2026_without_tiktok_id(alunos_set)
+    log(f"   👤 Ativos 2026 sem tiktok_id: {len(ativos):,}")
+    log(f"   📋 Total a processar: {len(alunos) + len(ativos):,}")
+
+    if not alunos and not ativos:
         log("✅ Todos os creators já têm tiktok_id!")
         return
 
     start_time = datetime.now()
 
-    # ETAPA 1 — Scraping
-    results = etapa1_scraping(creators)
+    # ETAPA 1 — Scraping (alunos primeiro, depois ativos)
+    results = etapa1_scraping(alunos, ativos)
 
     # ETAPA 2 — Avatars
     avatar_map = etapa2_avatars(results)
